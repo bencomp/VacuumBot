@@ -11,37 +11,13 @@
   """
 
 from time import localtime, sleep, strftime
-from olapi import OpenLibrary
-
+from openlibrary.api import OpenLibrary, OLError
+import codecs, re, simplejson
 
 
 def print_log(msg):
-  timestamp = strftime("%Y%m%d_%H:%M:%S", localtime())
-  print("[" + timestamp + "] " + msg)
-
-def set_identifier(book, id_name, id_value):
-  # OL handles the standard identifiers in a different way.
-  if id_name in ["isbn_10", "isbn_13", "oclc_numbers", "lccn"]:
-    ids = book.setdefault(id_name, [])
-    if id_value not in ids:
-      ids.append(id_value)
-  else:
-    ids = book.setdefault("identifiers", {})
-    ids[id_name] = [id_value]
-
-def set_goodreads_id(olid, goodreads_id):
-  book = ol.get(olid)
-  set_identifier(book, "goodreads", goodreads_id)
-  ol.save(book['key'], book, "Added goodreads ID.")
-
-def map_id(olid, isbn, goodreads_id):
-  book = ol.get(olid)
-  if book.has_key('identifiers'):
-    if book['identifiers'].has_key('goodreads'):
-      if goodreads_id in book['identifiers']['goodreads']:
-        return
-  print_log("Adding Goodreads ID \"" + goodreads_id + "\" to Openlibrary ID \"" + olid + "\"")
-  set_goodreads_id(olid, goodreads_id)
+  timestamp = strftime("%Y-%m-%d_%H:%M:%S", localtime())
+  print(unicode("[" + timestamp + "] " + msg).encode("utf-8"))
 
 class VacuumBot:
   """VacuumBot can help clean up Open Library, just tell it what to do!
@@ -54,6 +30,250 @@ class VacuumBot:
   def __init__(self, username, password):
     self.ol = OpenLibrary()
     self.ol.login(username, password)
+    self.pagreg = re.compile(r"[^\s]\s+[:;]$")
+    self.emptypagreg = re.compile(r"[,.:;]+$")
+    self.formatdict = simplejson.load(codecs.open("formatdict.json", "rb", "utf-8"))
+    self.enc2 = codecs.getencoder("ascii")
+  
+  def enc(self, str):
+    return self.enc2(str, "backslashreplace")[0]
+  
+  def save_error(self, key, message):
+    errorfile = codecs.EncodedFile(open("vacuumbot-errors.txt", "ab"), "unicode_internal", "utf-8", "replace")
+    errorfile.write(unicode("[" + strftime("%Y-%m-%d_%H:%M:%S", localtime()) + "] Could not save record for: " + key + ", error was: " + message + "\n"))
+    errorfile.close()
+  
+  def query(self, query):
+    return self.ol.query(query)
+  
+  def ol_save(self, key, record, message):
+    try:
+      self.ol.save(key, record, self.enc(message))
+      print_log("Saved "+key+": "+message)
+    except OLError as e:
+      self.save_error(key, str(e))
+      print_log("Save failed: "+str(e))
+  
+  def ol_get(self, key, v=None):
+    """Gets a record from OL and catches OLErrors.
+    
+    Make sure you check for None when you process this function's result.
+    """
+    try:
+      return self.ol.get(key, v)
+    except OLError as e:
+      self.save_error(key, str(e))
+      print_log("Get failed: "+str(e))
+  
+  def clean_author_dates(self):
+    for year in range(1900, 2013):
+      authors = self.query({"type": "/type/author", "death_date": str(year)+".", "limit": False})
+      print_log("Getting authors with death date '" + str(year) + "'...")
+      for author in authors:
+        obj = self.ol_get(author)
+        self.clean_author(obj)
+        sleep(2)
+          
+      done = codecs.EncodedFile(open("cleanauthors-done.txt", "ab"), "unicode_internal", "utf-8", "replace")
+      done.write("Death date '" + str(year) + ".' updated to '" + str(year) + "'\n")
+      done.close()
+    
+  def clean_author(self, obj):
+    """Clean author records. For example removes the period after the death date.
+    
+    """
+    # Remove period from death date
+    comment = []
+    result1 = self.clean_death_date(obj)
+    if result1 != None:
+      comment.append("Removed period from death date")
+      
+    if len(comment) > 0:
+      self.ol_save(obj["key"], result1, "; ".join(comment))
+  
+  def clean_death_date(self, obj):
+    changed = False
+    if "death_date" in obj.keys():
+      if re.match(r"^\d{4}\.", obj["death_date"]):
+        obj["death_date"] = obj["death_date"].rstrip(" .")
+        changed = True
+      elif obj["death_date"] == "":
+        del obj["death_date"]
+        changed = True
+    
+    if changed:
+      return obj
+    else:
+      return None
+  
+  def clean_physical_object(self, obj):
+    """Cleans up physical aspects of the given object, such as format and pagination. Returns the cleaned obj.
+    
+    Physical format: calls self.clean_format(obj).
+    Pagination: calls self.clean_pagination(obj).
+    """
+    obj1 = self.clean_format(obj)
+    if obj1 != None:
+      obj2 = self.clean_pagination(obj1)
+    else:
+      obj2 = self.clean_pagination(obj)
+    
+    if obj2 != None:
+      return obj2
+    else:
+      return obj
+  
+  def clean_format(self, obj):
+    """Cleans up the obj's physical_format field, removing it from obj if necessary.
+    
+    Checks the current value of physical_format, looks up the replacement value and updates if new value is different from current value. If the format field is empty after this, it is removed.
+    
+    If nothing changed or there is no physical_format field to begin with, None is returned.
+    """
+    if "physical_format" in obj.keys():
+      if obj["physical_format"] == "":
+        # Remove empty field and return
+        del obj["physical_format"]
+        return obj
+      else:
+        # Check if there is a better format
+        v = self._check_format(obj["physical_format"])
+        if v != "":
+          # Use new value
+          obj["physical_format"] = v
+          return obj
+        elif v == "":
+          # New value would leave empty field -> remove field
+          del obj["physical_format"]
+          return obj
+        else:
+          return None
+        
+    else:
+      return None
+  
+  def _check_format(self, format):
+    # if format matches punctuation regular expression, create normalized format string before lookup
+    checkstr = re.sub(r"", "", format)
+    # and look up replacement format in dictionary
+    if checkstr in self.formatdict.keys() and self.formatdict[checkstr] != format:
+      return self.formatdict[checkstr]
+    else:
+      # if there is no new value or new is same as original, don't update.
+      return False
+  
+  def replace_formats(self, old, new):
+    """Replaces the old value in physical format fields by the new value.
+    
+    This method tries to process all records with old as format value, which are potentially millions of records.
+    """
+    print_log("Getting records with format '"+old+"'...")
+    olids = self.ol.query({"type":"/type/edition", "physical_format": old, "limit": False})
+    for r in olids:
+      print "Improving", r
+      self.replace_format(r, old, new)
+      sleep(4)
+  
+  def replace_formats_clean_pagination(self, old, new):
+    """Replaces the old value in physical format fields by the new value.
+    
+    This method tries to process all records with old as format value, which are potentially millions of records.
+    """
+    print_log("Getting records with format '"+old+"'...")
+    olids = self.ol.query({"type":"/type/edition", "physical_format": old, "limit": False})
+    for olid in olids:
+      gotit = False
+      tries = 0
+      while (not gotit and tries <= 5):
+        obj = self.ol_get(olid)
+        if obj:
+          gotit = True
+        else:
+          sleep(10)
+          tries = tries + 1
+      
+      if not gotit:
+        raise Exception("timeout")
+      
+      comment = []
+      print "Improving", olid
+      # Step 1: replace format
+      result1 = self.replace_format2(obj, old, new)
+      if result1:
+        comment.append("Updated format '"+old+"' to '"+new+"'")
+      else:
+        result1 = obj
+      
+      # Step 2: Use Step 1 output
+      result2 = self.clean_pagination(result1)
+      if result2:
+        comment.append("cleaned up pagination")
+      else:
+        result2 = result1
+      
+      # Something changed if comment is not empty
+      if len(comment) != 0:
+        self.ol_save(obj["key"], result2, "; ".join(comment))
+        print_log("; ".join(comment))
+      else:
+        print_log("Did nothing, really.")
+      sleep(3)
+  
+  def replace_format(self, olid, old, new):
+    """Replaces a value from the physical format field.
+    
+    """
+    try:
+      obj = self.ol.get(olid)
+    except OLError as e:
+      self.save_error(olid, str(e))
+      return
+    
+    if "physical_format" in obj.keys() and obj["physical_format"] == old:
+        obj["physical_format"] = new
+        print_log("updating format for "+olid)
+        self.ol_save(obj["key"], obj, "Updated format '"+old+"' to '"+new+"'")
+  
+  def replace_format2(self, obj, old, new):
+    """Replaces a value from the physical format field.
+    
+    Returns None if nothing changed, else returns updated obj.
+    """
+    
+    if "physical_format" in obj.keys() and obj["physical_format"] == old:
+      obj["physical_format"] = new
+      print_log("updating format for "+obj["key"])
+      return obj
+    elif "physical_format" in obj.keys() and obj["physical_format"] == "":
+      del obj["physical_format"]
+      return obj
+    else:
+      return None
+  
+  def clean_pagination(self, obj):
+    """Removes spaces, semicolons and colons from the end of the pagination field of obj and returns the updated obj, or None if nothing changed.
+    
+    If the pagination field is empty or only contains a combination of ',', '.', ';' and ':', the field is removed.
+    """
+    if "pagination" in obj.keys():
+      # Strip commas, semicolons, colons, forward slashes and spaces from the right.
+      new = obj["pagination"].rstrip(" ,;:/")
+      if obj["pagination"] == new:
+        # Pagination did not change.
+        return None
+      else:
+        obj["pagination"] = new
+    
+    else:
+      # There is no pagination field; return None.
+      return None
+    
+    # If the field is empty, or only has ignorable characters, remove the field.
+    if "pagination" in obj.keys() and (obj["pagination"] == "" or self.emptypagreg.match(obj["pagination"])):
+      del obj["pagination"]
+    
+    # If execution gets here, the obj must have been changed.
+    return obj
   
   def remove_classification_value(self, obj, type, value):
     """Removes a value from the list of <type> classifications.
@@ -117,7 +337,7 @@ class VacuumBot:
     object = ol.get(olid)
     if key in object:
       del object[key]
-      ol.save(object['key'], object, "Sucked up \"" + key + "\".")
+      self.ol_save(object['key'], object, "Sucked up \"" + key + "\".")
     
 
   def deduplicate_values(self, olid, key):
