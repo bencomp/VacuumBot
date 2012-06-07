@@ -19,6 +19,13 @@ def print_log(msg):
   timestamp = strftime("%Y-%m-%d_%H:%M:%S", localtime())
   print(unicode("[" + timestamp + "] " + msg).encode("utf-8"))
 
+class OLBuffer:
+  """Tools to buffer Open Library API interactions.
+  
+  """
+  def __init__(self):
+    pass
+  
 class VacuumBot:
   """VacuumBot can help clean up Open Library, just tell it what to do!
   
@@ -34,6 +41,8 @@ class VacuumBot:
     self.emptypagreg = re.compile(r"[,.:;]+$")
     self.formatdict = simplejson.load(codecs.open("formatdict.json", "rb", "utf-8"))
     self.enc2 = codecs.getencoder("ascii")
+    self.savebuffer = {}
+    self.badrecords = []
   
   def enc(self, str):
     return self.enc2(str, "backslashreplace")[0]
@@ -53,6 +62,31 @@ class VacuumBot:
     except OLError as e:
       self.save_error(key, str(e))
       print_log("Save failed: "+str(e))
+  
+  def ol_save2(self, key, record, message):
+    if message != None:
+      if message in self.savebuffer.keys():
+        self.savebuffer[message].append(record)
+        if len(self.savebuffer[message]) >= 100:
+          self.flush(message)
+      else:
+        self.savebuffer[message] = [record]
+    else:
+      raise Exception("Message for saving is missing!")
+  
+  def flush(self, buffer_name):
+    try:
+      if len(self.savebuffer[buffer_name]) > 0:
+        self.ol.save_many(self.savebuffer[buffer_name], self.enc(buffer_name))
+        print_log("Flushed buffer ("+str(len(self.savebuffer[buffer_name]))+" records): "+buffer_name)
+        self.savebuffer[buffer_name] = []
+        sleep(1)
+    except OLError as e:
+      self.save_error(self.savebuffer[buffer_name][0]["key"], "Multisave failed: "+str(e))
+  
+  def flush_all(self):
+    for m in self.savebuffer.keys():
+      self.flush(m)
   
   def ol_get(self, key, v=None):
     """Gets a record from OL and catches OLErrors.
@@ -78,6 +112,35 @@ class VacuumBot:
       done.write("Death date '" + str(year) + ".' updated to '" + str(year) + "'\n")
       done.close()
     
+  def clean_author_dates2(self):
+    for year in range(0,1000):
+      # Get keys of all authors with death date <x>
+      authors = self.query({"type": "/type/author", "death_date": str(year)+".", "limit": False})
+      print_log("Getting authors with death date '" + str(year) + "'...")
+      list = []
+      for author in authors:
+        # Feed authors to buffer list
+        list.append(author)
+        if len(list) > 99:
+          # Process these few authors before continuing feeding
+          # Get records
+          print_log("Getting full records")
+          
+          records = self.ol.get_many(list)
+          for obj in records.itervalues():
+            self.clean_author2(obj)
+          list = []
+          
+      if len(list) > 0:
+        records = self.ol.get_many(list)
+        for obj in records.itervalues():
+          self.clean_author2(obj)
+      self.flush_all()
+      done = codecs.EncodedFile(open("cleanauthors-done.txt", "ab"), "unicode_internal", "utf-8", "replace")
+      done.write(unicode("Death date '" + str(year) + ".' updated to '" + str(year) + "'\n"))
+      done.close()
+      sleep(0.5)
+  
   def clean_author(self, obj):
     """Clean author records. For example removes the period after the death date.
     
@@ -91,10 +154,23 @@ class VacuumBot:
     if len(comment) > 0:
       self.ol_save(obj["key"], result1, "; ".join(comment))
   
+  def clean_author2(self, obj):
+    """Clean author records. For example removes the period after the death date.
+    
+    """
+    # Remove period from death date
+    comment = []
+    result1 = self.clean_death_date(obj)
+    if result1 != None:
+      comment.append("Removed period from death date")
+      
+    if len(comment) > 0:
+      self.ol_save2(obj["key"], result1, "; ".join(comment))
+  
   def clean_death_date(self, obj):
     changed = False
     if "death_date" in obj.keys():
-      if re.match(r"^\d{4}\.", obj["death_date"]):
+      if re.match(r"^\d{1,4}\.", obj["death_date"]):
         obj["death_date"] = obj["death_date"].rstrip(" .")
         changed = True
       elif obj["death_date"] == "":
@@ -107,7 +183,7 @@ class VacuumBot:
       return None
   
   def clean_physical_object(self, obj):
-    """Cleans up physical aspects of the given object, such as format and pagination. Returns the cleaned obj.
+    """Cleans up physical aspects of the given Edition object, such as format and pagination. Returns the cleaned obj.
     
     Physical format: calls self.clean_format(obj).
     Pagination: calls self.clean_pagination(obj).
@@ -218,6 +294,53 @@ class VacuumBot:
       else:
         print_log("Did nothing, really.")
       sleep(3)
+  
+  def replace_formats_clean_pagination2(self, old, new):
+    """Replaces the old value in physical format fields by the new value.
+    
+    This method tries to process all records with old as format value, which are potentially millions of records.
+    """
+    print_log("Getting records with format '"+old+"'...")
+    olids = self.ol.query({"type":"/type/edition", "physical_format": old, "limit": False})
+    list = []
+    for olid in olids:
+      # Feed authors to buffer list
+      list.append(olid)
+      if len(list) > 99:
+        # Process these few authors before continuing feeding
+        # Get records
+        print_log("Getting full records")
+        records = self.ol.get_many(list)
+        for obj in records.itervalues():
+          self._replace_formats_clean_pagination(obj, old, new)
+        list = []
+        
+    if len(list) > 0:
+      records = self.ol.get_many(list)
+      for obj in records.itervalues():
+        self._replace_formats_clean_pagination(obj, old, new)
+    self.flush_all()
+    
+  
+  def _replace_formats_clean_pagination(self, obj, old, new):
+    comment = []
+    # Step 1: replace format
+    result1 = self.replace_format2(obj, old, new)
+    if result1:
+      comment.append("Updated format '"+old+"' to '"+new+"'")
+    else:
+      result1 = obj
+
+    # Step 2: Use Step 1 output
+    result2 = self.clean_pagination(result1)
+    if result2:
+      comment.append("cleaned up pagination")
+    else:
+      result2 = result1
+
+    # Something changed if comment is not empty
+    if len(comment) != 0:
+      self.ol_save2(obj["key"], result2, "; ".join(comment))
   
   def replace_format(self, olid, old, new):
     """Replaces a value from the physical format field.
