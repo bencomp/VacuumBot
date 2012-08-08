@@ -43,6 +43,8 @@ class VacuumBot:
     self.enc2 = codecs.getencoder("ascii")
     self.savebuffer = {}
     self.badrecords = []
+    self.aucache = {}
+    self.wocache = {}
   
   def enc(self, str):
     return self.enc2(str, "backslashreplace")[0]
@@ -66,23 +68,32 @@ class VacuumBot:
   def ol_save2(self, key, record, message):
     if message != None:
       if message in self.savebuffer.keys():
-        self.savebuffer[message].append(record)
+        self.savebuffer[message][key] = record
         if len(self.savebuffer[message]) >= 100:
           self.flush(message)
       else:
-        self.savebuffer[message] = [record]
+        self.savebuffer[message] = {}
+        self.savebuffer[message][key] = record
     else:
       raise Exception("Message for saving is missing!")
   
   def flush(self, buffer_name):
     try:
       if len(self.savebuffer[buffer_name]) > 0:
-        self.ol.save_many(self.savebuffer[buffer_name], self.enc(buffer_name))
+        self.ol.save_many(self.savebuffer[buffer_name].values(), self.enc(buffer_name))
         print_log("Flushed buffer ("+str(len(self.savebuffer[buffer_name]))+" records): "+buffer_name)
-        self.savebuffer[buffer_name] = []
+        self.savebuffer[buffer_name] = {}
         sleep(1)
     except OLError as e:
-      self.save_error(self.savebuffer[buffer_name][0]["key"], "Multisave failed: "+str(e))
+      # Try to remove rejected record from buffer
+      err_mess = simplejson.loads(re.sub(r'^[^{]*', "", str(e)))
+      if err_mess["error"] == "bad_data":
+        k = err_mess["at"]["key"]
+        del self.savebuffer[buffer_name][k]
+        self.save_error(k, "Multisave failed: "+str(e)+"; removed record from buffer")
+      else:
+        k = self.savebuffer[buffer_name].keys()[0]
+        self.save_error(k, "Multisave failed: "+str(e))
   
   def flush_all(self):
     for m in self.savebuffer.keys():
@@ -182,6 +193,51 @@ class VacuumBot:
     else:
       return None
   
+  def update_author_in_edition(self):
+    aucache = {}
+    for line in open("errors3.txt", "rb"):
+      error = simplejson.loads(line)
+      if error["error"] == "bad_data":
+        olid = error["at"]["key"]
+        try:
+          obj = self.ol_get(olid)
+          print "Edition found and downloaded"
+          if "works" in obj.keys() and len(obj["works"]) > 0:
+            # Get work, see if it has at least one author
+            work = self.ol_get(obj["works"][0])
+            print "Work found and downloaded"
+            if "authors" in work.keys() and len(work["authors"]) > 0:
+              del obj["authors"]
+              self.ol_save(olid, obj, "Removed author from Edition (author found in Work)")
+          else:
+            # Get author and find new author key
+            if "authors" in obj.keys() and len(obj["authors"]) > 0:
+              newau = []
+              for auID in obj["authors"]:
+                if auID in aucache.keys():
+                  # already looked up and stored in cache
+                  newau.append(aucache[auID])
+                  print "new ID found in cache"
+                else:
+                  # lookup author's new ID
+                  newID = self.find_new_author(auID)
+                  aucache[auID] = newID
+                  newau.append(newID)
+              obj["authors"] = newau
+              self.ol_save(olid, obj, "Updated author in Edition (author was merged but not updated here)")
+        except:
+          print "Error trying to fix", olid
+  
+  
+  def find_new_author(self, olid):
+    obj = self.ol_get(olid)
+    print "downloaded", olid
+    if obj["type"] == "/type/author":
+      return obj["key"]
+    elif obj["type"] == "/type/redirect":
+      return self.find_new_author(obj["location"])
+      
+
   def clean_physical_object(self, obj):
     """Cleans up physical aspects of the given Edition object, such as format and pagination. Returns the cleaned obj.
     
@@ -301,7 +357,7 @@ class VacuumBot:
     This method tries to process all records with old as format value, which are potentially millions of records.
     """
     print_log("Getting records with format '"+old+"'...")
-    olids = self.ol.query({"type":"/type/edition", "physical_format": old, "limit": False})
+    olids = self.ol.query({"type":"/type/edition", "physical_format": old, "limit": 1000})
     list = []
     for olid in olids:
       # Feed authors to buffer list
@@ -337,10 +393,53 @@ class VacuumBot:
       comment.append("cleaned up pagination")
     else:
       result2 = result1
+    
+    # Step 3: use Step 2 output
+    result3 = self._update_author_in_edition(result2)
+    if result3:
+      comment.append("Removed author from Edition (author found in Work)")
+    else:
+      result3 = result2
 
     # Something changed if comment is not empty
     if len(comment) != 0:
-      self.ol_save2(obj["key"], result2, "; ".join(comment))
+      self.ol_save2(obj["key"], result3, "; ".join(comment))
+  
+  def _update_author_in_edition(self, obj):
+    try:
+      workhasauthors = False
+      if "works" in obj.keys() and len(obj["works"]) > 0:
+        wID = obj["works"][0]
+        if wID in self.wocache.keys():
+          print "Work ID found in cache"
+          workhasauthors = self.wocache[wID]
+        else:
+          # Get work, see if it has at least one author
+          work = self.ol_get(wID)
+          print "Work found and downloaded"
+          self.wocache[wID] = "authors" in work.keys() and len(work["authors"]) > 0
+        
+        if workhasauthors and "authors" in obj.keys():
+          del obj["authors"]
+          return obj
+      else:
+        # Get author and find new author key
+        if "authors" in obj.keys() and len(obj["authors"]) > 0:
+          newau = []
+          for auID in obj["authors"]:
+            if auID in self.aucache.keys():
+              # already looked up and stored in cache
+              newau.append(self.aucache[auID])
+              print "new ID found in cache"
+            else:
+              # lookup author's new ID
+              newID = self.find_new_author(auID)
+              self.aucache[auID] = newID
+              newau.append(newID)
+          obj["authors"] = newau
+          self.ol_save(olid, obj, "Updated author in Edition (author was merged but not updated here)")
+    except:
+      print "Error trying to fix", olid
   
   def replace_format(self, olid, old, new):
     """Replaces a value from the physical format field.
