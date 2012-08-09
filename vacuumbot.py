@@ -236,7 +236,11 @@ class VacuumBot:
       return obj["key"]
     elif obj["type"] == "/type/redirect":
       return self.find_new_author(obj["location"])
-      
+    elif obj["type"] == "/type/delete":
+      # author was deleted, undelete
+      obj["type"] = "/type/author"
+      self.ol_save(obj["key"], obj, "Undeleted record, because other records still referred to it")
+      return obj["key"]
 
   def clean_physical_object(self, obj):
     """Cleans up physical aspects of the given Edition object, such as format and pagination. Returns the cleaned obj.
