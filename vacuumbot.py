@@ -11,8 +11,8 @@
   """
 
 from time import localtime, sleep, strftime
-from openlibrary.api import OpenLibrary, OLError
-import codecs, re, simplejson
+from openlibrary.api import OpenLibrary, OLError, marshal
+import codecs, re, simplejson, sys
 
 
 def print_log(msg):
@@ -382,64 +382,79 @@ class VacuumBot:
     comment = []
     # Step 1: replace format
     result1 = self.replace_format2(obj, old, new)
-    if result1:
-      comment.append("Updated format '"+old+"' to '"+new+"'")
-    else:
-      result1 = obj
+    if result1[1]:
+      comment.append(result1[1])
 
     # Step 2: Use Step 1 output
-    result2 = self.clean_pagination(result1)
-    if result2:
-      comment.append("cleaned up pagination")
-    else:
-      result2 = result1
+    result2 = self.clean_pagination(result1[0])
+    if result2[1]:
+      comment.append(result2[1])
     
     # Step 3: use Step 2 output
-    result3 = self._update_author_in_edition(result2)
-    if result3:
-      comment.append("Removed author from Edition (author found in Work)")
-    else:
-      result3 = result2
+    result3 = self._update_author_in_edition(result2[0])
+    if result3[1]:
+      comment.append(result3[1])
 
     # Something changed if comment is not empty
     if len(comment) != 0:
-      self.ol_save2(obj["key"], result3, "; ".join(comment))
+      self.ol_save2(obj["key"], result3[0], "; ".join(comment))
   
   def _update_author_in_edition(self, obj):
-    try:
+    #try:
       workhasauthors = False
-      if "works" in obj.keys() and len(obj["works"]) > 0:
-        wID = obj["works"][0]
+      hasauthors = "authors" in obj.keys() and len(obj["authors"]) > 0
+      
+      if not hasauthors:
+        return (obj, None)
+      elif "works" in obj.keys() and len(obj["works"]) > 0:
+        #print obj["works"][0]
+        wID = obj["works"][0]["key"]
         if wID in self.wocache.keys():
-          print "Work ID found in cache"
+          print "Work ID found in cache", wID
           workhasauthors = self.wocache[wID]
         else:
           # Get work, see if it has at least one author
           work = self.ol_get(wID)
-          print "Work found and downloaded"
+          print "Work found and downloaded", wID
           self.wocache[wID] = "authors" in work.keys() and len(work["authors"]) > 0
+          workhasauthors = self.wocache[wID]
         
         if workhasauthors and "authors" in obj.keys():
           del obj["authors"]
-          return obj
+          return (obj, "Removed author from Edition (author found in Work)")
+        else:
+          # Edition has authors, Work has no authors. Work should be updated and then authors removed from edition.
+          # for now, update authors in edition (that causes error). Leave rest to WorkBot.
+          return self._replace_authors(obj)
+          
       else:
-        # Get author and find new author key
-        if "authors" in obj.keys() and len(obj["authors"]) > 0:
-          newau = []
-          for auID in obj["authors"]:
-            if auID in self.aucache.keys():
-              # already looked up and stored in cache
-              newau.append(self.aucache[auID])
-              print "new ID found in cache"
-            else:
-              # lookup author's new ID
-              newID = self.find_new_author(auID)
-              self.aucache[auID] = newID
-              newau.append(newID)
-          obj["authors"] = newau
-          self.ol_save(olid, obj, "Updated author in Edition (author was merged but not updated here)")
-    except:
-      print "Error trying to fix", olid
+        return self._replace_authors(obj)
+    #except Exception as e:
+     # print "Error trying to fix", obj["key"]
+      #print sys.exc_info()
+  
+  def _replace_authors(self, obj):
+    newau = []
+    for au in obj["authors"]:
+      auID = au["key"]
+      if auID in self.aucache.keys():
+        # already looked up and stored in cache
+        newau.append({"key": self.aucache[auID]})
+        print "new ID found in cache"
+      else:
+        # lookup author's new ID
+        newID = self.find_new_author(auID)
+        self.aucache[auID] = newID
+        newau.append({"key": newID})
+      
+    print obj["authors"]
+    print newau
+    if obj["authors"] != newau:
+      obj["authors"] = newau
+      comment = "replaced author(s) in Edition (reference was outdated)"
+      return (obj, comment)
+    else:
+      return (obj, None)
   
   def replace_format(self, olid, old, new):
     """Replaces a value from the physical format field.
@@ -459,43 +474,44 @@ class VacuumBot:
   def replace_format2(self, obj, old, new):
     """Replaces a value from the physical format field.
     
-    Returns None if nothing changed, else returns updated obj.
+    Returns a tuple (obj, comment). comment is None if nothing changed. obj is updated or unchanged input obj.
     """
     
     if "physical_format" in obj.keys() and obj["physical_format"] == old:
       obj["physical_format"] = new
       print_log("updating format for "+obj["key"])
-      return obj
+      return (obj, "Updated format '"+old+"' to '"+new+"'")
     elif "physical_format" in obj.keys() and obj["physical_format"] == "":
       del obj["physical_format"]
-      return obj
+      return (obj, "Deleted empty physical format field")
     else:
-      return None
+      return (obj, None)
   
   def clean_pagination(self, obj):
-    """Removes spaces, semicolons and colons from the end of the pagination field of obj and returns the updated obj, or None if nothing changed.
+    """Removes spaces, semicolons and colons from the end of the pagination field of obj.
     
     If the pagination field is empty or only contains a combination of ',', '.', ';' and ':', the field is removed.
+    
+    Returns a tuple of the possibly updated obj and a comment (which is None if nothing changed).
     """
     if "pagination" in obj.keys():
       # Strip commas, semicolons, colons, forward slashes and spaces from the right.
       new = obj["pagination"].rstrip(" ,;:/")
       if obj["pagination"] == new:
         # Pagination did not change.
-        return None
+        return (obj, None)
+      elif obj["pagination"] == "" or new == "" or self.emptypagreg.match(obj["pagination"]):
+        # field is empty, or only has ignorable characters, remove the field.
+        del obj["pagination"]
+        return (obj, "deleted empty pagination field")
       else:
         obj["pagination"] = new
-    
+        return (obj, "cleaned up pagination")
+        
     else:
       # There is no pagination field; return None.
-      return None
+      return (obj, None)
     
-    # If the field is empty, or only has ignorable characters, remove the field.
-    if "pagination" in obj.keys() and (obj["pagination"] == "" or self.emptypagreg.match(obj["pagination"])):
-      del obj["pagination"]
-    
-    # If execution gets here, the obj must have been changed.
-    return obj
   
   def remove_classification_value(self, obj, type, value):
     """Removes a value from the list of <type> classifications.
