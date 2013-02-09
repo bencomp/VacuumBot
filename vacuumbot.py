@@ -11,9 +11,37 @@
   """
 
 from time import localtime, sleep, strftime
-from openlibrary.api import OpenLibrary, OLError, marshal
+from openlibrary.api import OpenLibrary, OLError, marshal, unmarshal, Text, Reference
 import codecs, re, simplejson, sys
 
+import nomenklatura
+import itertools
+"""
+class NKCache(object):
+"""
+"""Interface to the Nomenklatura reconciliation database with local caching.
+  
+  Code for this class was adapted from 
+  http://schoolofdata.org/handbook/recipes/reconciling-data-with-nomenklatura/
+"""
+"""def __init__(self,dataset,key):
+      self.ds=nomenklatura.Dataset(dataset,api_key=key)
+      self.fetch()
+
+  def fetch(self):
+      links=itertools.ifilter(lambda x: x.value: self.ds.links())
+      self.cache=dict(((l.key,l.value["value"]) for l in links))
+
+  def lookup(self,key):
+      if key in self.cache.keys():
+         return self.cache[key]
+      else:
+          try:
+              value=self.ds.lookup(key)
+              return value.value
+          except self.ds.NoMatch:
+              return key
+"""
 
 def print_log(msg):
   timestamp = strftime("%Y-%m-%d_%H:%M:%S", localtime())
@@ -35,6 +63,9 @@ class VacuumBot:
   """
   
   def __init__(self, username, password):
+    """Takes a username and password of a bot account to establish a connection to OL.
+    
+    """
     self.ol = OpenLibrary()
     self.ol.login(username, password)
     self.pagreg = re.compile(r"[^\s]\s+[:;]$")
@@ -45,9 +76,16 @@ class VacuumBot:
     self.badrecords = []
     self.aucache = {}
     self.wocache = {}
+    #self.formatcache = NKCache("ol_books_formats", api_key = "cfdeaeda-4a22-4ae7-a2bf-1634da98fa1b")
+    self.logfile = codecs.EncodedFile(open("vacuumbot-log.tsv", "ab"), "unicode_internal", "utf-8", "replace")
   
   def enc(self, str):
     return self.enc2(str, "backslashreplace")[0]
+  
+  def flog(self, key, operation, message):
+    """Log to file 'vacuumbot-log.tsv'. Lines are time, key, operation and message, tab-separated.
+    """
+    self.logfile.write(unicode(strftime("%Y-%m-%d_%H:%M:%S", localtime()) + "\t" + key + "\t" + operation + "\t" + message + "\n"))
   
   def save_error(self, key, message):
     errorfile = codecs.EncodedFile(open("vacuumbot-errors.txt", "ab"), "unicode_internal", "utf-8", "replace")
@@ -60,6 +98,7 @@ class VacuumBot:
   def ol_save(self, key, record, message):
     try:
       self.ol.save(key, record, self.enc(message))
+      self.flog(key, "direct save", message)
       print_log("Saved "+key+": "+message)
     except OLError as e:
       self.save_error(key, str(e))
@@ -67,6 +106,7 @@ class VacuumBot:
   
   def ol_save2(self, key, record, message):
     if message != None:
+      record = marshal(record)
       if message in self.savebuffer.keys():
         self.savebuffer[message][key] = record
         if len(self.savebuffer[message]) >= 100:
@@ -74,6 +114,7 @@ class VacuumBot:
       else:
         self.savebuffer[message] = {}
         self.savebuffer[message][key] = record
+      self.flog(key, "buffer save", message)
     else:
       raise Exception("Message for saving is missing!")
   
@@ -81,6 +122,8 @@ class VacuumBot:
     try:
       if len(self.savebuffer[buffer_name]) > 0:
         self.ol.save_many(self.savebuffer[buffer_name].values(), self.enc(buffer_name))
+        for key in self.savebuffer[buffer_name].keys():
+          self.flog(key, "buffer flush", buffer_name)
         print_log("Flushed buffer ("+str(len(self.savebuffer[buffer_name]))+" records): "+buffer_name)
         self.savebuffer[buffer_name] = {}
         sleep(1)
@@ -155,6 +198,7 @@ class VacuumBot:
   def clean_author(self, obj):
     """Clean author records. For example removes the period after the death date.
     
+    Saves the updated record directly, instead of putting it in the save buffer.
     """
     # Remove period from death date
     comment = []
@@ -168,6 +212,7 @@ class VacuumBot:
   def clean_author2(self, obj):
     """Clean author records. For example removes the period after the death date.
     
+    Saves the updated record in the save buffer.
     """
     # Remove period from death date
     comment = []
@@ -354,7 +399,36 @@ class VacuumBot:
       else:
         print_log("Did nothing, really.")
       sleep(3)
-  
+
+  def replace_split_formats_clean_pagination(self, old, new, by, sub, ot):
+    """Replaces the old value in physical format fields by the new value and puts the by statement in the correct place.
+    
+    This method tries to process 1000 records with old as format value, which are potentially millions of records.
+    """
+    print_log("Getting records with format '"+old+"'...")
+    olids = self.ol.query({"type":"/type/edition", "physical_format": old, "limit": 1000})
+    list = []
+    for olid in olids:
+      # Feed authors to buffer list
+      list.append(olid)
+      if len(list) > 99:
+        # Process these few authors before continuing feeding
+        # Get records
+        print_log("Getting full records")
+        records = self.ol.get_many(list)
+        for obj in records.itervalues():
+          obj = unmarshal(obj)
+          self._replace_split_formats_clean_pagination(obj, old, new, by, sub, ot)
+        list = []
+        
+    if len(list) > 0:
+      records = self.ol.get_many(list)
+      for obj in records.itervalues():
+        obj = unmarshal(obj)
+        self._replace_split_formats_clean_pagination(obj, old, new, by, sub, ot)
+    self.flush_all()
+
+    
   def replace_formats_clean_pagination2(self, old, new):
     """Replaces the old value in physical format fields by the new value.
     
@@ -372,12 +446,14 @@ class VacuumBot:
         print_log("Getting full records")
         records = self.ol.get_many(list)
         for obj in records.itervalues():
+          obj = unmarshal(obj)
           self._replace_formats_clean_pagination(obj, old, new)
         list = []
         
     if len(list) > 0:
       records = self.ol.get_many(list)
       for obj in records.itervalues():
+        obj = unmarshal(obj)
         self._replace_formats_clean_pagination(obj, old, new)
     self.flush_all()
     
@@ -402,7 +478,132 @@ class VacuumBot:
     # Something changed if comment is not empty
     if len(comment) != 0:
       self.ol_save2(obj["key"], result3[0], "; ".join(comment))
-  
+
+  def _replace_split_formats_clean_pagination(self, obj, old, new, by):
+    comment = []
+    # Step 1: replace format
+    result1 = self.replace_format2(obj, old, new)
+    if result1[1]:
+      comment.append(result1[1])
+    
+    # Step 1a: add the By statement
+    result1a = self.add_by(result1[0], by)
+    if result1a[1]:
+      comment.append(result1a[1])
+    
+    # Step 2: Use Step 1a output
+    result2 = self.clean_pagination(result1a[0])
+    if result2[1]:
+      comment.append(result2[1])
+    
+    # Step 3: use Step 2 output
+    result3 = self._update_author_in_edition(result2[0])
+    if result3[1]:
+      comment.append(result3[1])
+
+    # Something changed if comment is not empty
+    if len(comment) != 0:
+      self.ol_save2(obj["key"], result3[0], "; ".join(comment))
+      
+  def _replace_split_formats_clean_pagination(self, obj, old, new, by, sub, ot):
+    comment = []
+    # Step 1: replace format
+    result1 = self.replace_format2(obj, old, new)
+    if result1[1]:
+      comment.append(result1[1])
+    
+    # Step 1a: add the By statement
+    result1a = self.add_by(result1[0], by)
+    if result1a[1]:
+      comment.append(result1a[1])
+      
+    # Step 1b: add the subtitle
+    result1b = self.add_subtitle(result1a[0], sub)
+    if result1b[1]:
+      comment.append(result1b[1])
+      
+    # Step 1c: add the other_titles
+    result1c = self.add_subtitle(result1b[0], ot)
+    if result1c[1]:
+      comment.append(result1c[1])
+    
+    # Step 2: Use Step 1b output
+    result2 = self.clean_pagination(result1b[0])
+    if result2[1]:
+      comment.append(result2[1])
+    
+    # Step 3: use Step 2 output
+    result3 = self._update_author_in_edition(result2[0])
+    if result3[1]:
+      comment.append(result3[1])
+
+    # Something changed if comment is not empty
+    if len(comment) != 0:
+      self.ol_save2(obj["key"], result3[0], "; ".join(comment))
+
+  def add_by(self, obj, by):
+    if by != "":
+      if "by_statement" in obj.keys():
+        if len(obj["by_statement"]) == 0:
+          obj["by_statement"] = by
+          return (obj, "updated By statement")
+        elif "notes" in obj.keys(): # and "value" in obj["notes"].keys()
+          print self.enc(obj["notes"])
+          if isinstance(obj["notes"], Text):
+            obj["notes"] = obj["notes"] + "\n\nBy statement found in format: " + by + "\n"
+            return (obj, "added By statement to notes, because By statement field was not empty")
+          elif isinstance(obj["notes"], dict):
+            d = unmarshal(obj["notes"])
+            obj["notes"] = d + "\n\nBy statement found in format: " + by + "\n"
+            return (obj, "added By statement to notes, because By statement field was not empty")
+          else:
+            obj["notes"] = Text("By statement found in format: " + by + "\n")
+            return (obj, "put By statement in notes")
+        else:
+          obj["notes"] = Text("By statement found in format: " + by + "\n")
+          return (obj, "put By statement in notes")
+      else:
+        obj["by_statement"] = by
+        return (obj, "added By statement")
+    else:
+      return (obj, None)
+      
+  def add_subtitle(self, obj, sub):
+    if sub != "":
+      if "subtitle" in obj.keys():
+        if len(obj["subtitle"]) == 0:
+          obj["subtitle"] = sub
+          return (obj, "updated subtitle")
+        elif "notes" in obj.keys():
+          print self.enc(obj["notes"])
+          obj["notes"] = obj["notes"] + "\n\nSubtitle found in format: " + sub + "\n"
+          return (obj, "added subtitle to notes, because subtitle field was not empty")
+        else:
+          obj["notes"] = sub
+          return (obj, "put subtitle in notes")
+      else:
+        obj["subtitle"] = sub
+        return (obj, "added subtitle")
+    else:
+      return (obj, None)
+
+  def add_other_title(self, obj, ot):
+    if ot != "":
+      if "other_titles" in obj.keys():
+        if isinstance(obj["other_titles"], list):
+          obj["other_titles"].append(ot)
+          return (obj, "added title to other_titles")
+        elif isinstance(obj["other_titles"], string) or isinstance(obj["other_titles"], unicode):
+          obj["other_titles"] = [obj["other_titles"], ot]
+          return (obj, "changed other_titles from string to list of strings")
+        else:
+          raise Exception("other_titles is not a list or string")
+      else:
+        obj["other_titles"] = [ot]
+        return (obj, "created other_titles")
+    else:
+      return (obj, None)
+      
   def _update_author_in_edition(self, obj):
     #try:
       workhasauthors = False
@@ -412,7 +613,7 @@ class VacuumBot:
         return (obj, None)
       elif "works" in obj.keys() and len(obj["works"]) > 0:
         #print obj["works"][0]
-        wID = obj["works"][0]["key"]
+        wID = obj["works"][0]
         if wID in self.wocache.keys():
           print "Work ID found in cache", wID
           workhasauthors = self.wocache[wID]
@@ -439,17 +640,16 @@ class VacuumBot:
   
   def _replace_authors(self, obj):
     newau = []
-    for au in obj["authors"]:
-      auID = au["key"]
+    for auID in obj["authors"]:
       if auID in self.aucache.keys():
         # already looked up and stored in cache
-        newau.append({"key": self.aucache[auID]})
+        newau.append(Reference(self.aucache[auID]))
         print "new ID found in cache"
       else:
         # lookup author's new ID
         newID = self.find_new_author(auID)
         self.aucache[auID] = newID
-        newau.append({"key": newID})
+        newau.append(Reference(newID))
       
     print obj["authors"]
     print newau
