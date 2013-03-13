@@ -6,6 +6,9 @@ class OLRecord:
   def __init__(self, olid):
     self.r = {}
 
+  def __init__(self, record):
+    self.r = record
+    
   def cleanUp(self):
     pass 
 
@@ -20,3 +23,8 @@ class OLEdition(OLRecord):
   def get_title(self):
     return self.r["title"] or None
     
+class OLWork(OLRecord):
+  pass
+
+class OLAuthor(OLRecord):
+  pass
